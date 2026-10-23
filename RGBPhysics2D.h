@@ -1932,4 +1932,273 @@ public:
     }
 };
 
+// ============================================================================
+// 12. CAMERA 2D (RUNTIME FAR-VIEW ZOOM-OUT, SHAKE & SLOW-MOTION)
+// ============================================================================
+class Camera2D
+{
+public:
+    float zoom       = 1.0f;  // 1.0 = Normal Close-Up, 0.72 = Tactical, 0.50 = Far-View Story/Panorama
+    float targetZoom = 1.0f;
+    float anchorX    = 200.0f;
+    float anchorY    = 432.0f;
+
+    float shakeIntensity = 0.0f;
+    float shakeTimer     = 0.0f;
+    float shakeOffsetX   = 0.0f;
+    float shakeOffsetY   = 0.0f;
+
+    float slowMoScale    = 1.0f;
+    float slowMoTimer    = 0.0f;
+
+    void setTargetZoom(float z) {
+        targetZoom = constrain(z, 0.42f, 1.35f);
+    }
+
+    void cycleZoomPreset() {
+        if (targetZoom > 0.88f)      targetZoom = 0.68f; // Medium Tactical Zoom-Out
+        else if (targetZoom > 0.58f) targetZoom = 0.48f; // Far Panorama Zoom-Out (See ~1650px ahead!)
+        else                         targetZoom = 1.00f; // Normal Close-Up View
+    }
+
+    void triggerShake(float amplitude, float durationSec = 0.38f) {
+        shakeIntensity = amplitude;
+        shakeTimer     = durationSec;
+    }
+
+    void triggerSlowMotion(float scale, float durationSec = 0.85f) {
+        slowMoScale = constrain(scale, 0.15f, 1.0f);
+        slowMoTimer = durationSec;
+    }
+
+    float update(float rawDt) {
+        zoom += (targetZoom - zoom) * min(1.0f, rawDt * 7.5f);
+
+        if (shakeTimer > 0.0f) {
+            shakeTimer -= rawDt;
+            float decay = max(0.0f, shakeTimer * 2.5f);
+            shakeOffsetX = ((float)random(-100, 101) * 0.01f) * shakeIntensity * min(1.0f, decay);
+            shakeOffsetY = ((float)random(-100, 101) * 0.01f) * shakeIntensity * min(1.0f, decay);
+        } else {
+            shakeOffsetX = 0.0f;
+            shakeOffsetY = 0.0f;
+        }
+
+        if (slowMoTimer > 0.0f) {
+            slowMoTimer -= rawDt;
+            if (slowMoTimer <= 0.0f) slowMoScale = 1.0f;
+        }
+        return rawDt * slowMoScale;
+    }
+
+    inline int16_t worldToScreenX(float wx) const {
+        return (int16_t)(anchorX * zoom + (wx - anchorX) * zoom + shakeOffsetX);
+    }
+
+    inline int16_t worldToScreenY(float wy) const {
+        return (int16_t)(anchorY - (anchorY - wy) * zoom + shakeOffsetY);
+    }
+
+    inline int16_t scaleDim(float v) const {
+        return max((int16_t)1, (int16_t)(v * zoom));
+    }
+};
+
+// ============================================================================
+// 13. BLOOD SPLATTER, ARTERIAL DROPLETS & SURFACE DECAL SYSTEM
+// ============================================================================
+struct BloodDroplet {
+    bool active;
+    Vec2 pos;
+    Vec2 vel;
+    float radius;
+    uint16_t color;
+};
+
+struct GroundBloodDecal {
+    bool active;
+    float x;
+    int16_t width;
+    uint8_t alpha;
+};
+
+class BloodAndDecalSystem2D
+{
+public:
+    static constexpr int MAX_DROPLETS = 56;
+    static constexpr int MAX_DECALS   = 24;
+
+    BloodDroplet droplets[MAX_DROPLETS];
+    GroundBloodDecal decals[MAX_DECALS];
+    int nextDecalIdx = 0;
+
+    void clear() {
+        for (int i = 0; i < MAX_DROPLETS; i++) droplets[i].active = false;
+        for (int i = 0; i < MAX_DECALS; i++)   decals[i].active = false;
+    }
+
+    void emitBloodSplatter(float x, float y, int count = 36, float baseVx = -180.0f, float baseVy = -340.0f) {
+        const uint16_t bloodPalette[4] = {
+            Colors565::Crimson, Colors565::DarkRed, Colors565::Scarlet, Colors565::Maroon
+        };
+        int spawned = 0;
+        for (int i = 0; i < MAX_DROPLETS && spawned < count; i++) {
+            if (!droplets[i].active) {
+                droplets[i].active = true;
+                droplets[i].pos    = Vec2(x + random(-12, 13), y + random(-16, 17));
+                droplets[i].vel    = Vec2(baseVx + random(-240, 260), baseVy + random(-260, 140));
+                droplets[i].radius = (float)random(2, 6);
+                droplets[i].color  = bloodPalette[i & 3];
+                spawned++;
+            }
+        }
+    }
+
+    void update(float dt, float groundY, float scrollSpeedX = 0.0f) {
+        for (int i = 0; i < MAX_DECALS; i++) {
+            if (decals[i].active) {
+                decals[i].x -= scrollSpeedX * dt;
+                if (decals[i].x < -60.0f) decals[i].active = false;
+            }
+        }
+
+        for (int i = 0; i < MAX_DROPLETS; i++) {
+            if (!droplets[i].active) continue;
+            droplets[i].vel.y += 1450.0f * dt;
+            droplets[i].pos   += droplets[i].vel * dt;
+
+            if (droplets[i].pos.y >= groundY) {
+                droplets[i].active = false;
+                decals[nextDecalIdx].active = true;
+                decals[nextDecalIdx].x      = droplets[i].pos.x;
+                decals[nextDecalIdx].width  = (int16_t)random(10, 26);
+                decals[nextDecalIdx].alpha  = 210;
+                nextDecalIdx = (nextDecalIdx + 1) % MAX_DECALS;
+            }
+        }
+    }
+
+    void draw(RGBGameEngine &eng, int16_t groundY, const Camera2D *cam = nullptr) {
+        for (int i = 0; i < MAX_DECALS; i++) {
+            if (!decals[i].active) continue;
+            int16_t dx = cam ? cam->worldToScreenX(decals[i].x) : (int16_t)decals[i].x;
+            int16_t dw = cam ? cam->scaleDim(decals[i].width) : decals[i].width;
+            eng.fillRectAlpha(dx - dw / 2, groundY - 2, dw, 5, Colors565::Crimson, decals[i].alpha);
+        }
+        for (int i = 0; i < MAX_DROPLETS; i++) {
+            if (!droplets[i].active) continue;
+            int16_t px = cam ? cam->worldToScreenX(droplets[i].pos.x) : (int16_t)droplets[i].pos.x;
+            int16_t py = cam ? cam->worldToScreenY(droplets[i].pos.y) : (int16_t)droplets[i].pos.y;
+            int16_t tx = cam ? cam->worldToScreenX(droplets[i].pos.x - droplets[i].vel.x * 0.025f) : (int16_t)(droplets[i].pos.x - droplets[i].vel.x * 0.025f);
+            int16_t ty = cam ? cam->worldToScreenY(droplets[i].pos.y - droplets[i].vel.y * 0.025f) : (int16_t)(droplets[i].pos.y - droplets[i].vel.y * 0.025f);
+            int16_t r  = cam ? cam->scaleDim(droplets[i].radius) : (int16_t)droplets[i].radius;
+            eng.drawThickLine(px, py, tx, ty, r, droplets[i].color, true);
+        }
+    }
+};
+
+// ============================================================================
+// 14. ARTICULATED 2D SKELETAL RIG & RAGDOLL FALL-DOWN SOLVER
+// ============================================================================
+class SkeletalRig2D
+{
+public:
+    bool ragdollActive = false;
+    Vec2 pelvisPos, pelvisVel;
+    float torsoAngle = 0.0f;
+    float angularVel = 0.0f;
+
+    void triggerRagdollFall(float startX, float startY, float impactVx = -160.0f, float impactVy = -320.0f) {
+        ragdollActive = true;
+        pelvisPos  = Vec2(startX, startY);
+        pelvisVel  = Vec2(impactVx, impactVy);
+        torsoAngle = 0.0f;
+        angularVel = -5.2f;
+    }
+
+    void update(float dt, float groundY) {
+        if (!ragdollActive) return;
+        pelvisVel.y += 1550.0f * dt;
+        pelvisPos   += pelvisVel * dt;
+        torsoAngle  += angularVel * dt;
+
+        if (pelvisPos.y >= groundY - 14.0f) {
+            pelvisPos.y = groundY - 14.0f;
+            pelvisVel.y *= -0.32f;
+            pelvisVel.x *= 0.72f;
+            angularVel  *= 0.55f;
+            torsoAngle = constrain(torsoAngle, -1.52f, 1.52f);
+        }
+    }
+};
+
+// ============================================================================
+// 15. RADIAL & VORTEX FORCE FIELD 2D
+// ============================================================================
+enum class ForceFieldType : uint8_t {
+    VORTEX_PULL      = 0,
+    GRAVITY_INVERT   = 1,
+    REPULSE_WAVE     = 2,
+    MAGNETIC_DIPOLE  = 3,
+    TIME_SLOW_AURA   = 4
+};
+
+class ForceField2D
+{
+public:
+    Vec2 center;
+    float radius = 140.0f;
+    float strength = 480.0f;
+    ForceFieldType type = ForceFieldType::VORTEX_PULL;
+
+    Vec2 computeAcceleration(Vec2 targetPos, Vec2 targetVel) const {
+        Vec2 d = center - targetPos;
+        float d2 = d.lengthSq();
+        if (d2 > radius * radius || d2 < 4.0f) return Vec2(0, 0);
+        float dist = sqrtf(d2);
+        Vec2 dir = d * (1.0f / dist);
+        float falloff = 1.0f - (dist / radius);
+
+        switch (type) {
+            case ForceFieldType::VORTEX_PULL:
+                return dir * (strength * falloff) + Vec2(-dir.y, dir.x) * (strength * 0.65f * falloff);
+            case ForceFieldType::GRAVITY_INVERT:
+                return Vec2(0.0f, -strength * 2.2f);
+            case ForceFieldType::REPULSE_WAVE:
+                return dir * (-strength * 1.5f * falloff);
+            case ForceFieldType::MAGNETIC_DIPOLE:
+                return dir * (strength * falloff * falloff);
+            case ForceFieldType::TIME_SLOW_AURA:
+            default:
+                return targetVel * (-3.5f * falloff);
+        }
+    }
+};
+
+// ============================================================================
+// 16. RLE COMPRESSED SPRITE & MULTI-STATE FLIPBOOK ANIMATOR
+// ============================================================================
+class SpriteAnimator2D
+{
+public:
+    int currentFrame = 0;
+    int frameCount   = 16;
+    float frameTimer = 0.0f;
+    float fps        = 30.0f;
+    bool looping     = true;
+
+    void update(float dt) {
+        frameTimer += dt;
+        float interval = 1.0f / max(1.0f, fps);
+        while (frameTimer >= interval) {
+            frameTimer -= interval;
+            if (currentFrame + 1 < frameCount) {
+                currentFrame++;
+            } else if (looping) {
+                currentFrame = 0;
+            }
+        }
+    }
+};
+
 #endif

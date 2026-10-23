@@ -1711,6 +1711,83 @@ void RGBGameEngine::drawShockwaveRing(int16_t cx, int16_t cy, int16_t radius, in
     drawCircle(cx, cy, rInner, Colors565::White);
 }
 
+void RGBGameEngine::drawParallaxHorizonStrip(const int16_t *heightMap, int count, int16_t segmentWidth, float scrollX, int16_t baseY, uint16_t litColor, uint16_t shadowColor, uint16_t snowCapColor, int16_t snowThreshold)
+{
+    if (!heightMap || count < 2 || segmentWidth <= 0) return;
+    int32_t totalPeriod = (int32_t)count * segmentWidth;
+    int32_t scrollInt = ((int32_t)scrollX % totalPeriod + totalPeriod) % totalPeriod;
+
+    for (int16_t x = 0; x < display.width; x++) {
+        int32_t wx = x + scrollInt;
+        int idx0 = (wx / segmentWidth) % count;
+        int idx1 = (idx0 + 1) % count;
+        int16_t rem = (int16_t)(wx % segmentWidth);
+
+        int16_t h0 = heightMap[idx0];
+        int16_t h1 = heightMap[idx1];
+        int16_t h  = h0 + (int16_t)(((int32_t)(h1 - h0) * rem) / segmentWidth);
+        int16_t topY = max((int16_t)0, (int16_t)(baseY - h));
+        int16_t colH = baseY - topY;
+        if (colH <= 0) continue;
+
+        uint16_t slopeCol = (h1 >= h0) ? litColor : shadowColor;
+        if (h > snowThreshold) {
+            int16_t snowSpan = min(colH, (int16_t)((h - snowThreshold) + 8));
+            drawFastVLine(x, topY, snowSpan, snowCapColor);
+            if (colH > snowSpan) {
+                drawFastVLine(x, topY + snowSpan, colH - snowSpan, slopeCol);
+            }
+        } else {
+            drawFastVLine(x, topY, colH, slopeCol);
+        }
+    }
+}
+
+void RGBGameEngine::drawAtmosphericSkyDome(float timeOfDay01, int16_t horizonY, bool drawStars)
+{
+    float phase = timeOfDay01 - floorf(timeOfDay01);
+    auto lerpCol = [](Color a, Color b, float t) -> Color {
+        t = constrain(t, 0.0f, 1.0f);
+        return Color((uint8_t)(a.r + (b.r - a.r) * t), (uint8_t)(a.g + (b.g - a.g) * t), (uint8_t)(a.b + (b.b - a.b) * t));
+    };
+
+    Color dawnTop(28, 36, 88),   dawnHor(255, 135, 75);
+    Color dayTop(22, 115, 225),  dayHor(145, 220, 255);
+    Color duskTop(42, 20, 78),   duskHor(255, 78, 42);
+    Color nightTop(6, 8, 22),    nightHor(18, 28, 58);
+
+    Color skyTop, skyHor;
+    float daylight = 1.0f;
+    if (phase < 0.15f) {
+        float u = phase / 0.15f;
+        skyTop = lerpCol(dawnTop, dayTop, u); skyHor = lerpCol(dawnHor, dayHor, u); daylight = 0.35f + 0.65f * u;
+    } else if (phase < 0.45f) {
+        skyTop = dayTop; skyHor = dayHor; daylight = 1.0f;
+    } else if (phase < 0.62f) {
+        float u = (phase - 0.45f) / 0.17f;
+        skyTop = lerpCol(dayTop, duskTop, u); skyHor = lerpCol(dayHor, duskHor, u); daylight = 0.95f - 0.65f * u;
+    } else if (phase < 0.90f) {
+        float u = min(1.0f, ((phase - 0.62f) / 0.28f) * 3.0f);
+        skyTop = lerpCol(duskTop, nightTop, u); skyHor = lerpCol(duskHor, nightHor, u); daylight = 0.18f;
+    } else {
+        float u = (phase - 0.90f) / 0.10f;
+        skyTop = lerpCol(nightTop, dawnTop, u); skyHor = lerpCol(nightHor, dawnHor, u); daylight = 0.18f + 0.17f * u;
+    }
+
+    fillLinearGradientRect(0, 0, display.width, horizonY, skyTop, skyHor, true, false);
+
+    if (drawStars && daylight < 0.55f) {
+        uint8_t starAlpha = (uint8_t)constrain((int)((0.55f - daylight) * 620.0f), 0, 240);
+        float t = millis() * 0.004f;
+        for (int i = 0; i < 42; i++) {
+            int16_t sx = (int16_t)((i * 197 + 37) % (display.width - 10) + 5);
+            int16_t sy = (int16_t)((i * 89 + 19) % max(20, horizonY / 2) + 10);
+            uint8_t tw = (uint8_t)constrain((int)(starAlpha * (0.55f + 0.45f * sinf(t + i * 1.7f))), 10, 255);
+            drawPixelAlpha(sx, sy, Colors565::White, tw);
+        }
+    }
+}
+
 void RGBGameEngine::drawIrisWipe(int16_t focusX, int16_t focusY, int16_t openRadius, uint16_t maskColor)
 {
     if (openRadius <= 0) {

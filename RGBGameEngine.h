@@ -176,7 +176,7 @@ public:
   void drawTextOutline(int16_t x, int16_t y, const char *str, uint16_t textColor, uint16_t outlineColor, uint8_t scale = 2);
 
   // ==================================================
-  // 11. SCREEN POST-PROCESSING & CAMERA FILTERS
+  // 11. SCREEN POST-PROCESSING, SKY DOME & TERRAIN
   // ==================================================
   void applyScreenTint(uint16_t tint565, uint8_t alpha = 160);
   void applyRedGameOverFilter();
@@ -184,6 +184,9 @@ public:
   void applyVignette(int16_t borderThickness = 90, uint8_t maxDarkness = 180);
   void drawShockwaveRing(int16_t cx, int16_t cy, int16_t radius, int16_t bandWidth, float strength = 8.0f);
   void drawIrisWipe(int16_t focusX, int16_t focusY, int16_t openRadius, uint16_t maskColor = 0x0000);
+
+  void drawParallaxHorizonStrip(const int16_t *heightMap, int count, int16_t segmentWidth, float scrollX, int16_t baseY, uint16_t litColor, uint16_t shadowColor, uint16_t snowCapColor = Colors565::White, int16_t snowThreshold = 125);
+  void drawAtmosphericSkyDome(float timeOfDay01, int16_t horizonY, bool drawStars = true);
 
 private:
   static RGBGameEngine *instance;
