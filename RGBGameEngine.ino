@@ -504,12 +504,19 @@ void triggerCurrentShatter(float hitX, float hitY)
     uint16_t matColors[5] = {
         Colors565::ElectricBlue, Colors565::Silver, Colors565::Peru, Colors565::Gold, Colors565::Turquoise
     };
+    ShatterShape shapes[5] = {
+        ShatterShape::RECTANGLE, ShatterShape::CIRCLE, ShatterShape::RECTANGLE, ShatterShape::TRIANGLE, ShatterShape::ELLIPSE
+    };
+    int avgCount = (int)(48 * constrain(globalIntensity, 0.5f, 2.2f));
     shatterLab.triggerShatter(
         400.0f, 215.0f, 92.0f,
         hitX, hitY,
         (ShatterMaterial)shatterMatIdx,
         globalIntensity,
-        matColors[shatterMatIdx]
+        matColors[shatterMatIdx],
+        nullptr, 0, 0,
+        avgCount,
+        shapes[shatterMatIdx]
     );
     shatterTriggerMs = millis();
 }

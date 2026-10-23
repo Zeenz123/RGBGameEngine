@@ -219,29 +219,172 @@ struct Spring2D
 };
 
 // ============================================================================
-// 3. REALISTIC CONTIGUOUS FRACTURE & SHATTER ENGINE (ZERO RING ARTIFACTS)
-//    Subdivides solid rectangular/polygonal objects into 100% gap-free
-//    interlocking Voronoi/planar triangles radiating from impact (hitX, hitY).
+// 3. UNIVERSAL PORTABLE RADIAL FRACTURE & SHATTER WRAPPER ENGINE
+//    - Wraps ANY object shape (Rectangle, Circle, Ellipse, Triangle, Polygon),
+//      ANY Sprite/Image (const uint16_t*), or ANY live-rendered drawing lambda!
+//    - Fractures radially from the exact hit point (hitX, hitY):
+//      * Shards NEAR (hitX, hitY) are SMALL high-velocity impact splinters.
+//      * Shards FARTHER from (hitX, hitY) grow RADIALLY LARGER (power-law r^1.82).
+//    - Generates a true random mixture of UNEVEN TRAPEZIUMS (4-gon),
+//      IRREGULAR QUADRILATERALS (4-gon), and UNEVEN TRIANGLES (3-gon).
+//    - Average particle count (avgParticleCount) and blast intensity are
+//      dynamically controllable at runtime!
 // ============================================================================
 enum class ShatterMaterial : uint8_t
 {
-    GLASS = 0,       // Tempered Window Pane: sharp interlocking glass wedges with 3D tumble & floor clatter
-    STONE,           // Heavy Stone Monolith: chunky rock slabs with high mass & low bounce rubble pile
-    WOOD,            // Wooden Crate / Plank: fibrous vertical/diagonal grain splinters
-    METAL_SPARKS,    // Molten / Heated Steel Plate: glowing Kelvin-cooling shrapnel
-    PIXEL_DISSOLVE   // Ceramic / Porcelain Tile: crisp glazed polygon plates
+    GLASS = 0,       // Tempered Window Pane: translucent glass trapeziums/quads/triangles with specular glint
+    STONE,           // Heavy Stone Monolith / Boulder: chunky rock slabs & trapeziums with high mass
+    WOOD,            // Wooden Crate / Plank: uneven fibrous splinters & trapeziums
+    METAL_SPARKS,    // Molten / Heated Steel Plate: glowing Kelvin-cooling shrapnel polygons
+    PIXEL_DISSOLVE   // Ceramic / Porcelain / Sprite Object: crisp polygon plates with sampled image colors
+};
+
+enum class ShatterShape : uint8_t
+{
+    RECTANGLE = 0,
+    CIRCLE,
+    ELLIPSE,
+    TRIANGLE,
+    POLYGON,
+    SPRITE_IMAGE
+};
+
+struct ShatterTarget2D
+{
+    ShatterShape shape = ShatterShape::RECTANGLE;
+    float x = 300.0f;       // Left X (Rect/Sprite) or Center X (Circle/Ellipse)
+    float y = 150.0f;       // Top Y  (Rect/Sprite) or Center Y (Circle/Ellipse)
+    float w = 160.0f;       // Width  (Rect/Sprite) or RadiusX  (Circle/Ellipse)
+    float h = 160.0f;       // Height (Rect/Sprite) or RadiusY  (Circle/Ellipse)
+    Vec2 polyVerts[8];      // Vertices for TRIANGLE (3) or POLYGON (3..8)
+    uint8_t polyCount = 0;
+
+    // Optional Sprite / Framebuffer Image sampling
+    const uint16_t *pixels = nullptr;
+    int16_t pixelW = 0;
+    int16_t pixelH = 0;
+    int16_t pixelStride = 0;      // Row stride in pixels (defaults to pixelW; 800 for live framebuffer capture!)
+    uint16_t transparentKey = 0x0000;
+    bool cullTransparent = false; // When true, shards landing on transparent/background pixels are culled
+    uint16_t baseColor = Colors565::ElectricBlue;
+
+    static ShatterTarget2D makeRect(float rx, float ry, float rw, float rh, uint16_t col = Colors565::ElectricBlue) {
+        ShatterTarget2D t;
+        t.shape = ShatterShape::RECTANGLE;
+        t.x = rx; t.y = ry; t.w = rw; t.h = rh; t.baseColor = col;
+        return t;
+    }
+
+    static ShatterTarget2D makeCircle(float cx, float cy, float radius, uint16_t col = Colors565::Silver) {
+        ShatterTarget2D t;
+        t.shape = ShatterShape::CIRCLE;
+        t.x = cx; t.y = cy; t.w = radius; t.h = radius; t.baseColor = col;
+        return t;
+    }
+
+    static ShatterTarget2D makeEllipse(float cx, float cy, float rx, float ry, uint16_t col = Colors565::DarkOrange) {
+        ShatterTarget2D t;
+        t.shape = ShatterShape::ELLIPSE;
+        t.x = cx; t.y = cy; t.w = rx; t.h = ry; t.baseColor = col;
+        return t;
+    }
+
+    static ShatterTarget2D makeTriangle(Vec2 a, Vec2 b, Vec2 c, uint16_t col = Colors565::Crimson) {
+        ShatterTarget2D t;
+        t.shape = ShatterShape::TRIANGLE;
+        t.polyVerts[0] = a; t.polyVerts[1] = b; t.polyVerts[2] = c;
+        t.polyCount = 3;
+        float minX = min(a.x, min(b.x, c.x)), maxX = max(a.x, max(b.x, c.x));
+        float minY = min(a.y, min(b.y, c.y)), maxY = max(a.y, max(b.y, c.y));
+        t.x = minX; t.y = minY; t.w = max(8.0f, maxX - minX); t.h = max(8.0f, maxY - minY);
+        t.baseColor = col;
+        return t;
+    }
+
+    static ShatterTarget2D makePolygon(const Vec2 *pts, uint8_t count, uint16_t col = Colors565::Gold) {
+        ShatterTarget2D t;
+        t.shape = ShatterShape::POLYGON;
+        t.polyCount = min((uint8_t)8, max((uint8_t)3, count));
+        float minX = pts[0].x, maxX = pts[0].x, minY = pts[0].y, maxY = pts[0].y;
+        for (uint8_t i = 0; i < t.polyCount; i++) {
+            t.polyVerts[i] = pts[i];
+            minX = min(minX, pts[i].x); maxX = max(maxX, pts[i].x);
+            minY = min(minY, pts[i].y); maxY = max(maxY, pts[i].y);
+        }
+        t.x = minX; t.y = minY; t.w = max(8.0f, maxX - minX); t.h = max(8.0f, maxY - minY);
+        t.baseColor = col;
+        return t;
+    }
+
+    static ShatterTarget2D makeSprite(const uint16_t *img, int16_t sw, int16_t sh,
+                                      float drawX, float drawY, float renderW = 0.0f, float renderH = 0.0f,
+                                      uint16_t transKey = 0x0000, uint16_t fallbackCol = Colors565::White) {
+        ShatterTarget2D t;
+        t.shape = ShatterShape::SPRITE_IMAGE;
+        t.x = drawX; t.y = drawY;
+        t.w = (renderW > 1.0f) ? renderW : (float)sw;
+        t.h = (renderH > 1.0f) ? renderH : (float)sh;
+        t.pixels = img;
+        t.pixelW = sw;
+        t.pixelH = sh;
+        t.pixelStride = sw;
+        t.transparentKey = transKey;
+        t.cullTransparent = true;
+        t.baseColor = fallbackCol;
+        return t;
+    }
+
+    // Wrap ANY region of the live RGB565 framebuffer (e.g. right after drawing a procedural creature/object)
+    static ShatterTarget2D makeFromFramebuffer(const uint16_t *framebuf, int16_t fbWidth, int16_t fbHeight,
+                                               float boxX, float boxY, float boxW, float boxH,
+                                               ShatterShape boundaryShape = ShatterShape::RECTANGLE,
+                                               uint16_t fallbackCol = Colors565::ElectricBlue) {
+        ShatterTarget2D t;
+        int16_t ix = (int16_t)constrain((int)boxX, 0, fbWidth - 2);
+        int16_t iy = (int16_t)constrain((int)boxY, 0, fbHeight - 2);
+        int16_t iw = (int16_t)constrain((int)boxW, 4, fbWidth - ix);
+        int16_t ih = (int16_t)constrain((int)boxH, 4, fbHeight - iy);
+
+        t.shape = boundaryShape;
+        if (boundaryShape == ShatterShape::CIRCLE || boundaryShape == ShatterShape::ELLIPSE) {
+            t.x = boxX + boxW * 0.5f;
+            t.y = boxY + boxH * 0.5f;
+            t.w = boxW * 0.5f;
+            t.h = boxH * 0.5f;
+        } else if (boundaryShape == ShatterShape::TRIANGLE) {
+            t.polyVerts[0] = Vec2(boxX + boxW * 0.5f, boxY);
+            t.polyVerts[1] = Vec2(boxX + boxW, boxY + boxH);
+            t.polyVerts[2] = Vec2(boxX, boxY + boxH);
+            t.polyCount = 3;
+            t.x = boxX; t.y = boxY; t.w = boxW; t.h = boxH;
+        } else {
+            t.x = (float)ix; t.y = (float)iy; t.w = (float)iw; t.h = (float)ih;
+        }
+
+        if (framebuf) {
+            t.pixels = &framebuf[iy * fbWidth + ix];
+            t.pixelW = iw;
+            t.pixelH = ih;
+            t.pixelStride = fbWidth;
+        }
+        t.cullTransparent = false;
+        t.baseColor = fallbackCol;
+        return t;
+    }
 };
 
 struct Shard2D
 {
     Vec2 pos;
     Vec2 vel;
-    Vec2 localVerts[3]; // Exact contiguous triangle vertices relative to centroid
+    Vec2 localVerts[4]; // Up to 4 vertices relative to centroid: 3 = uneven triangle, 4 = uneven trapezium / quadrilateral!
+    uint8_t vertCount;  // 3 or 4
+    float area;         // True polygon surface area (smaller near impact, larger radially outward!)
     float angle;
     float angularVel;
     float tumblePhase;  // Simulates 3D out-of-plane tumbling foreshortening
     float tumbleSpeed;
-    float releaseDelay; // Crack propagation delay (impact center breaks first, edges peel a few ms later)
+    float releaseDelay; // Crack propagation delay (impact center breaks first, outer slabs peel ms later)
     float boundingR;    // Distance to farthest vertex for accurate floor contact
     float heatKelvin;
     uint16_t baseColor;
@@ -254,9 +397,11 @@ struct Shard2D
 class ShatterSystem2D
 {
 public:
-    static constexpr int MAX_SHARDS = 112;
+    static constexpr int MAX_SHARDS = 128;
     Shard2D shards[MAX_SHARDS];
     ShatterMaterial material;
+    int defaultAvgParticles = 48; // Controllable average shard count per break!
+    int lastSpawnedCount    = 0;
     float gravity;
     float bounce;
     float floorFriction;
@@ -264,15 +409,20 @@ public:
     bool active;
 
     ShatterSystem2D()
-        : material(ShatterMaterial::GLASS), gravity(1150.0f), bounce(0.32f),
-          floorFriction(0.82f), floorY(438.0f), active(false)
+        : material(ShatterMaterial::GLASS), defaultAvgParticles(48), lastSpawnedCount(0),
+          gravity(1150.0f), bounce(0.32f), floorFriction(0.82f), floorY(438.0f), active(false)
     {
         clear();
     }
 
     void clear() {
         active = false;
+        lastSpawnedCount = 0;
         for (int i = 0; i < MAX_SHARDS; i++) shards[i].active = false;
+    }
+
+    void setAvgParticleCount(int avgCount) {
+        defaultAvgParticles = constrain(avgCount, 8, MAX_SHARDS);
     }
 
     // Draw the intact physical object before impact (Window Pane, Stone Slab, Wood Crate, etc.)
@@ -284,18 +434,15 @@ public:
         int16_t y = (int16_t)centerY - h / 2;
 
         if (mat == ShatterMaterial::GLASS) {
-            // Translucent framed glass window pane with diagonal specular sheen
             eng.fillRectAlpha(x, y, w, h, baseColor, 135);
             eng.drawThickLine(x + 18, y + h - 22, x + w - 28, y + 18, 6, Colors565::White, true);
             eng.drawThickLine(x + 42, y + h - 18, x + w - 16, y + 42, 3, Colors565::LightSkyBlue, true);
             eng.drawThickRect(x, y, w, h, 3, Colors565::White);
         } else if (mat == ShatterMaterial::STONE) {
-            // Chiseled stone block with beveled highlight & shadow border
             eng.fillRect(x, y, w, h, baseColor);
             eng.fillRect(x + 6, y + 6, w - 12, h - 12, Color::scaleBrightness565(baseColor, 215));
             eng.drawThickRect(x, y, w, h, 3, Colors565::LightGray);
         } else if (mat == ShatterMaterial::WOOD) {
-            // Wooden crate with plank seams and diagonal brace
             eng.fillRect(x, y, w, h, baseColor);
             uint16_t darkWood = Color::scaleBrightness565(baseColor, 150);
             for (int px = x + 28; px < x + w; px += 28) {
@@ -309,25 +456,208 @@ public:
         }
     }
 
+private:
+    // Compute exact ray distance from (hitX, hitY) along unit direction (dx, dy) to the wrapped object's outer boundary!
+    static float computeRayBoundaryDist(const ShatterTarget2D &target, float hitX, float hitY, float dx, float dy)
+    {
+        switch (target.shape)
+        {
+            case ShatterShape::CIRCLE: {
+                float ocx = hitX - target.x;
+                float ocy = hitY - target.y;
+                float r   = max(6.0f, target.w);
+                float b   = ocx * dx + ocy * dy;
+                float c   = ocx * ocx + ocy * ocy - r * r;
+                float disc = max(0.0f, b * b - c);
+                return max(6.0f, -b + sqrtf(disc));
+            }
+
+            case ShatterShape::ELLIPSE: {
+                float rx = max(6.0f, target.w);
+                float ry = max(6.0f, target.h);
+                float ox = (hitX - target.x) / rx;
+                float oy = (hitY - target.y) / ry;
+                float vx = dx / rx;
+                float vy = dy / ry;
+                float a  = vx * vx + vy * vy;
+                float b  = ox * vx + oy * vy;
+                float c  = ox * ox + oy * oy - 1.0f;
+                float disc = max(0.0f, b * b - a * c);
+                return max(6.0f, (-b + sqrtf(disc)) / max(0.0001f, a));
+            }
+
+            case ShatterShape::TRIANGLE:
+            case ShatterShape::POLYGON: {
+                float minT = 1e6f;
+                int n = (target.polyCount >= 3) ? target.polyCount : 3;
+                for (int i = 0; i < n; i++) {
+                    Vec2 A = target.polyVerts[i];
+                    Vec2 B = target.polyVerts[(i + 1) % n];
+                    Vec2 E = B - A;
+                    // Solve hit + t * d = A + u * E
+                    float denom = dx * E.y - dy * E.x;
+                    if (fabsf(denom) > 0.0001f) {
+                        float ax = A.x - hitX;
+                        float ay = A.y - hitY;
+                        float t = (ax * E.y - ay * E.x) / denom;
+                        float u = (ax * dy  - ay * dx)  / denom;
+                        if (t > 1.0f && u >= -0.02f && u <= 1.02f) {
+                            minT = min(minT, t);
+                        }
+                    }
+                }
+                if (minT < 1e5f) return max(6.0f, minT);
+                // Fallback to bounding box if hit point was slightly outside polygon
+                break;
+            }
+
+            default:
+                break;
+        }
+
+        // RECTANGLE or SPRITE_IMAGE bounding box ray intersection
+        float left   = target.x;
+        float right  = target.x + max(8.0f, target.w);
+        float top    = target.y;
+        float bottom = target.y + max(8.0f, target.h);
+
+        float tx = (dx > 0.0001f) ? ((right - hitX) / dx) : ((dx < -0.0001f) ? ((left - hitX) / dx) : 1e6f);
+        float ty = (dy > 0.0001f) ? ((bottom - hitY) / dy) : ((dy < -0.0001f) ? ((top - hitY) / dy) : 1e6f);
+        return max(6.0f, min(tx, ty));
+    }
+
+    // Emit a single 3-gon (uneven triangle) or 4-gon (uneven trapezium / irregular quadrilateral) shard
+    void addPolygonShard(
+        const ShatterTarget2D &target,
+        const Vec2 *verts,
+        uint8_t vCount,
+        float hitX, float hitY,
+        float maxObjRadius,
+        float intensity)
+    {
+        if (lastSpawnedCount >= MAX_SHARDS || vCount < 3) return;
+
+        // Compute centroid and true polygon area via Shoelace formula
+        Vec2 centroid(0.0f, 0.0f);
+        float signedArea2 = 0.0f;
+        for (uint8_t i = 0; i < vCount; i++) {
+            centroid += verts[i];
+            const Vec2 &p0 = verts[i];
+            const Vec2 &p1 = verts[(i + 1) % vCount];
+            signedArea2 += (p0.x * p1.y - p1.x * p0.y);
+        }
+        centroid = centroid * (1.0f / (float)vCount);
+        float polyArea = max(4.0f, fabsf(signedArea2) * 0.5f);
+
+        // Determine bounding box origin for sprite/framebuffer pixel sampling
+        float boxLeft = (target.shape == ShatterShape::CIRCLE || target.shape == ShatterShape::ELLIPSE)
+                        ? (target.x - target.w) : target.x;
+        float boxTop  = (target.shape == ShatterShape::CIRCLE || target.shape == ShatterShape::ELLIPSE)
+                        ? (target.y - target.h) : target.y;
+        float boxW    = (target.shape == ShatterShape::CIRCLE || target.shape == ShatterShape::ELLIPSE)
+                        ? (target.w * 2.0f) : max(1.0f, target.w);
+        float boxH    = (target.shape == ShatterShape::CIRCLE || target.shape == ShatterShape::ELLIPSE)
+                        ? (target.h * 2.0f) : max(1.0f, target.h);
+
+        uint16_t sampledCol = target.baseColor;
+        if (target.pixels && target.pixelW > 0 && target.pixelH > 0) {
+            int sx = constrain((int)(((centroid.x - boxLeft) / boxW) * target.pixelW), 0, target.pixelW - 1);
+            int sy = constrain((int)(((centroid.y - boxTop)  / boxH) * target.pixelH), 0, target.pixelH - 1);
+            int stride = (target.pixelStride > 0) ? target.pixelStride : target.pixelW;
+            uint16_t c = target.pixels[sy * stride + sx];
+
+            // If centroid lands on transparent key, probe the shard's vertices before culling
+            if (c == target.transparentKey) {
+                for (uint8_t vi = 0; vi < vCount; vi++) {
+                    int vx = constrain((int)(((verts[vi].x - boxLeft) / boxW) * target.pixelW), 0, target.pixelW - 1);
+                    int vy = constrain((int)(((verts[vi].y - boxTop)  / boxH) * target.pixelH), 0, target.pixelH - 1);
+                    uint16_t vc = target.pixels[vy * stride + vx];
+                    if (vc != target.transparentKey) { c = vc; break; }
+                }
+            }
+            if (c == target.transparentKey && target.cullTransparent) {
+                return; // Outside the sprite's non-transparent silhouette!
+            }
+            if (c != target.transparentKey) {
+                sampledCol = c;
+            }
+        } else {
+            uint8_t shade = (uint8_t)random(168, 255);
+            sampledCol = Color::scaleBrightness565(target.baseColor, shade);
+        }
+
+        Shard2D &sh = shards[lastSpawnedCount++];
+        sh.active    = true;
+        sh.settled   = false;
+        sh.vertCount = vCount;
+        sh.pos       = centroid;
+        sh.area      = polyArea;
+
+        float maxR = 2.0f;
+        for (uint8_t i = 0; i < vCount; i++) {
+            sh.localVerts[i] = verts[i] - centroid;
+            float r = sh.localVerts[i].length();
+            if (r > maxR) maxR = r;
+        }
+        sh.boundingR   = maxR * 0.65f;
+        sh.angle       = 0.0f;
+        sh.tumblePhase = (float)random(0, 314) * 0.01f;
+        sh.alpha       = (material == ShatterMaterial::GLASS) ? 180 : 255;
+        sh.heatKelvin  = 7800.0f;
+        sh.baseColor   = sampledCol;
+        sh.edgeColor   = (material == ShatterMaterial::GLASS)
+                         ? Colors565::White
+                         : Color::scaleBrightness565(sampledCol, 115);
+
+        // --------------------------------------------------------------------
+        // RADIAL IMPACT PHYSICS:
+        // - Near (hitX, hitY): Small area -> light mass + high proximity impulse
+        //   => explosive radial velocity & rapid spin!
+        // - Farther from (hitX, hitY): Large area -> heavy mass + lower impulse
+        //   => slower heavy tumble and radial crack propagation delay!
+        // --------------------------------------------------------------------
+        Vec2 fromHit = centroid - Vec2(hitX, hitY);
+        float dist   = fromHit.length();
+        Vec2 dir     = (dist > 0.5f) ? (fromHit / dist) : Vec2((float)random(-100, 101) * 0.01f, -0.8f).normalized();
+
+        float normDist = constrain(dist / max(12.0f, maxObjRadius), 0.0f, 1.0f);
+        // Nonlinear impact falloff: maximum force right at hit point!
+        float impactProx = 1.0f / (1.0f + normDist * normDist * 4.5f);
+        // Smaller pieces (near impact) have higher inverse-mass acceleration
+        float invMassBoost = constrain(32.0f / sqrtf(polyArea), 0.55f, 2.15f);
+
+        sh.releaseDelay = normDist * 0.048f; // Crack wave propagates radially outward in 0..48ms
+
+        float radialSpeed = (65.0f + 240.0f * impactProx * invMassBoost) * intensity;
+        float tangJitter  = (float)random(-55, 56) * intensity;
+        Vec2 tang(-dir.y, dir.x);
+
+        sh.vel = dir * radialSpeed + tang * tangJitter + Vec2(0.0f, -45.0f * impactProx * intensity);
+        sh.angularVel  = ((dir.x >= 0.0f ? 1.0f : -1.0f) * (1.8f + 7.5f * impactProx * invMassBoost)
+                         + (float)random(-25, 26) * 0.1f) * intensity;
+        sh.tumbleSpeed = (2.4f + 5.2f * impactProx * invMassBoost) * intensity;
+    }
+
+public:
     // ------------------------------------------------------------------------
-    // Fracture a solid rectangular object into 100% contiguous, gap-free
-    // interlocking triangles radiating from (impactX, impactY).
-    // Zero concentric rings, zero missing triangles!
+    // UNIVERSAL RADIAL FRACTURE ENGINE FOR ANY WRAPPED TARGET SHAPE OR IMAGE
     // ------------------------------------------------------------------------
-    void triggerShatter(
-        float centerX, float centerY, float halfSize,
+    void shatterTarget(
+        const ShatterTarget2D &target,
         float impactX, float impactY,
-        ShatterMaterial mat = ShatterMaterial::GLASS,
+        int avgParticleCount = -1,
         float intensity = 1.0f,
-        uint16_t baseColor = Colors565::ElectricBlue,
-        const uint16_t *spritePixels = nullptr, int16_t spriteW = 0, int16_t spriteH = 0)
+        ShatterMaterial mat = ShatterMaterial::GLASS)
     {
         clear();
         material = mat;
         active = true;
-        intensity = constrain(intensity, 0.2f, 2.5f);
+        intensity = constrain(intensity, 0.2f, 2.8f);
 
-        // Material physical constants (gravity, floor restitution, sliding friction)
+        int desiredAvg = (avgParticleCount > 0) ? avgParticleCount : defaultAvgParticles;
+        // Add +/- 15% natural random variance around avgParticleCount so every break is unique
+        int targetTotal = constrain(desiredAvg + (int)random(-desiredAvg / 6, desiredAvg / 6 + 1), 8, MAX_SHARDS);
+
         switch (mat) {
             case ShatterMaterial::GLASS:
                 gravity = 1180.0f; bounce = 0.26f; floorFriction = 0.88f; break;
@@ -341,124 +671,207 @@ public:
                 gravity = 1220.0f; bounce = 0.24f; floorFriction = 0.86f; break;
         }
 
-        float objW = halfSize * 2.1f;
-        float objH = halfSize * 1.95f;
-        float left = centerX - objW * 0.5f;
-        float top  = centerY - objH * 0.5f;
+        // Clamp impact point inside the wrapped shape so radial cracks emanate from the hit point
+        float hitX = impactX;
+        float hitY = impactY;
+        if (target.shape == ShatterShape::CIRCLE || target.shape == ShatterShape::ELLIPSE) {
+            float dx = (impactX - target.x) / max(6.0f, target.w);
+            float dy = (impactY - target.y) / max(6.0f, target.h);
+            float d  = sqrtf(dx * dx + dy * dy);
+            if (d > 0.78f) {
+                hitX = target.x + (dx / d) * target.w * 0.78f;
+                hitY = target.y + (dy / d) * target.h * 0.78f;
+            }
+        } else {
+            float marginX = min(14.0f, target.w * 0.22f);
+            float marginY = min(14.0f, target.h * 0.22f);
+            hitX = constrain(impactX, target.x + marginX, target.x + target.w - marginX);
+            hitY = constrain(impactY, target.y + marginY, target.y + target.h - marginY);
+        }
 
-        // Clamp impact point inside or near the object so fracture radiates naturally from hit location
-        float hitX = constrain(impactX, left + 12.0f, left + objW - 12.0f);
-        float hitY = constrain(impactY, top  + 12.0f, top  + objH - 12.0f);
+        // Determine radial sector rays (S) and concentric fracture rings (R) from targetTotal
+        // About 25% of cells split into 2 pieces, so S * R * 1.25 ~= targetTotal
+        int S = constrain((int)(sqrtf((float)targetTotal * 1.65f) + random(-1, 2)), 5, 16);
+        int R = constrain((int)(((float)targetTotal / (float)S) * 0.85f + 0.5f), 2, 7);
 
-        // Resolution scales with intensity: up to 7x7 cells = 49 quads = 98 contiguous triangles!
-        int cols = (mat == ShatterMaterial::WOOD) ? max(3, min(5, (int)(3 + intensity))) : max(4, min(7, (int)(4 + intensity * 1.3f)));
-        int rows = (mat == ShatterMaterial::WOOD) ? max(5, min(8, (int)(5 + intensity * 1.4f))) : max(4, min(7, (int)(4 + intensity * 1.3f)));
+        static constexpr int MAX_S = 16;
+        static constexpr int MAX_R = 7;
 
-        Vec2 grid[9][9];
-        float cellW = objW / cols;
-        float cellH = objH / rows;
+        Vec2 radialNodes[MAX_S][MAX_R + 1];
+        float rayAngles[MAX_S];
+        float rayMaxR[MAX_S];
+        float maxObjRadius = 16.0f;
 
-        // 1. Build contiguous planar fracture vertices (outer border stays exact; interior warps toward impact & jitters)
-        for (int r = 0; r <= rows; r++) {
-            for (int c = 0; c <= cols; c++) {
-                float gx = left + c * cellW;
-                float gy = top  + r * cellH;
+        // 1. Generate uneven radial crack angles around (hitX, hitY)
+        float angleStep = 6.2831853f / (float)S;
+        float basePhase = (float)random(0, 628) * 0.01f;
+        for (int s = 0; s < S; s++) {
+            float jitter = ((float)random(-34, 35) * 0.01f) * angleStep;
+            rayAngles[s] = basePhase + s * angleStep + jitter;
+            rayMaxR[s]   = computeRayBoundaryDist(target, hitX, hitY, cosf(rayAngles[s]), sinf(rayAngles[s]));
+            if (rayMaxR[s] > maxObjRadius) maxObjRadius = rayMaxR[s];
+        }
 
-                bool onLeftOrRight = (c == 0 || c == cols);
-                bool onTopOrBottom = (r == 0 || r == rows);
+        // 2. Place fracture nodes along each ray using a power-law r_k = R_max * (k / R)^1.82
+        //    so rings near (hitX, hitY) are tightly packed (SMALL shards) and outer rings
+        //    are wide apart (LARGE shards radially farther out!)
+        for (int s = 0; s < S; s++) {
+            // Epicenter node (k = 0) with slight micro-jitter around (hitX, hitY)
+            radialNodes[s][0] = Vec2(hitX + (float)random(-2, 3), hitY + (float)random(-2, 3));
 
-                if (!onLeftOrRight && !onTopOrBottom) {
-                    // Pull interior fracture nodes slightly toward impact point for realistic denser spiderweb at hit point
-                    Vec2 toHit(hitX - gx, hitY - gy);
-                    float d = toHit.length();
-                    float pull = (mat == ShatterMaterial::GLASS) ? constrain(1.0f - d / (objW * 0.85f), 0.0f, 0.42f) : 0.15f;
-                    gx += toHit.x * pull + (random(-38, 39) * 0.01f) * cellW;
-                    gy += toHit.y * pull + (random(-38, 39) * 0.01f) * cellH;
-                } else if (!onLeftOrRight) {
-                    // Jitter along top/bottom edge only horizontally so silhouette stays a crisp rectangle
-                    gx += (random(-30, 31) * 0.01f) * cellW;
-                } else if (!onTopOrBottom) {
-                    // Jitter along left/right edge only vertically
-                    gy += (random(-30, 31) * 0.01f) * cellH;
-                }
-                grid[r][c] = Vec2(gx, gy);
+            for (int k = 1; k <= R; k++) {
+                float u = powf((float)k / (float)R, 1.82f);
+                // Add per-node radial & angular perturbation so cells form uneven trapeziums & irregular quadrilaterals!
+                float rJitter = (k < R) ? (1.0f + ((float)random(-18, 19) * 0.01f) * (1.0f / (float)R)) : 1.0f;
+                float aJitter = (k < R) ? (((float)random(-22, 23) * 0.01f) * angleStep) : 0.0f;
+
+                float theta = rayAngles[s] + aJitter;
+                float rMax  = (k == R) ? computeRayBoundaryDist(target, hitX, hitY, cosf(theta), sinf(theta))
+                                       : (rayMaxR[s] * rJitter);
+                float rDist = max(3.0f, rMax * u);
+
+                radialNodes[s][k] = Vec2(hitX + cosf(theta) * rDist, hitY + sinf(theta) * rDist);
             }
         }
 
-        // 2. Triangulate every quad cell into TWO exact contiguous triangles (100% gap-free coverage!)
-        int idx = 0;
-        for (int r = 0; r < rows && idx < MAX_SHARDS; r++) {
-            for (int c = 0; c < cols && idx < MAX_SHARDS; c++) {
-                Vec2 p00 = grid[r][c];
-                Vec2 p10 = grid[r][c + 1];
-                Vec2 p11 = grid[r + 1][c + 1];
-                Vec2 p01 = grid[r + 1][c];
+        // 3. Emit Shards from Radial Web:
+        //    Mix of Uneven Triangles (3-gon), Uneven Trapeziums (4-gon), and Irregular Quadrilaterals (4-gon)!
+        for (int k = 0; k < R && lastSpawnedCount < MAX_SHARDS; k++) {
+            for (int s = 0; s < S && lastSpawnedCount < MAX_SHARDS; s++) {
+                int sNext = (s + 1) % S;
 
-                // Alternate or randomize diagonal split so fracture lines zig-zag organically
-                bool diagA = ((r + c + random(0, 2)) & 1) == 0;
+                if (k == 0) {
+                    // INNERMOST IMPACT ZONE (Right at hitX, hitY -> Smallest pieces!):
+                    // 50% chance: uneven acute impact triangle (3-gon)
+                    // 50% chance: truncated impact tip -> tiny core triangle (3-gon) + tiny uneven trapezium (4-gon)!
+                    Vec2 centerPt = radialNodes[s][0];
+                    Vec2 outerA   = radialNodes[s][1];
+                    Vec2 outerB   = radialNodes[sNext][1];
 
-                for (int tri = 0; tri < 2 && idx < MAX_SHARDS; tri++) {
-                    Vec2 v0, v1, v2;
-                    if (diagA) {
-                        if (tri == 0) { v0 = p00; v1 = p10; v2 = p11; }
-                        else          { v0 = p00; v1 = p11; v2 = p01; }
+                    if ((random(0, 100) < 52) && (lastSpawnedCount + 1 < MAX_SHARDS)) {
+                        float tCutA = 0.35f + (float)random(0, 22) * 0.01f;
+                        float tCutB = 0.35f + (float)random(0, 22) * 0.01f;
+                        Vec2 midA = Vec2::lerp(centerPt, outerA, tCutA);
+                        Vec2 midB = Vec2::lerp(centerPt, outerB, tCutB);
+
+                        Vec2 triVerts[3]  = { centerPt, midA, midB };
+                        Vec2 trapVerts[4] = { midA, outerA, outerB, midB };
+                        addPolygonShard(target, triVerts,  3, hitX, hitY, maxObjRadius, intensity);
+                        addPolygonShard(target, trapVerts, 4, hitX, hitY, maxObjRadius, intensity);
                     } else {
-                        if (tri == 0) { v0 = p00; v1 = p10; v2 = p01; }
-                        else          { v0 = p10; v1 = p11; v2 = p01; }
+                        Vec2 triVerts[3] = { centerPt, outerA, outerB };
+                        addPolygonShard(target, triVerts, 3, hitX, hitY, maxObjRadius, intensity);
                     }
+                    continue;
+                }
 
-                    Vec2 centroid = (v0 + v1 + v2) * (1.0f / 3.0f);
-                    Shard2D &sh = shards[idx++];
-                    sh.active = true;
-                    sh.settled = false;
-                    sh.pos = centroid;
-                    sh.localVerts[0] = v0 - centroid;
-                    sh.localVerts[1] = v1 - centroid;
-                    sh.localVerts[2] = v2 - centroid;
+                // RADIAL RINGS k = 1 .. R-1 (Progressively LARGER pieces radially outward!)
+                Vec2 p00 = radialNodes[s][k];
+                Vec2 p10 = radialNodes[sNext][k];
+                Vec2 p11 = radialNodes[sNext][k + 1];
+                Vec2 p01 = radialNodes[s][k + 1];
 
-                    float r0 = sh.localVerts[0].length();
-                    float r1 = sh.localVerts[1].length();
-                    float r2 = sh.localVerts[2].length();
-                    sh.boundingR = max(r0, max(r1, r2)) * 0.65f;
+                int fractureMode = random(0, 100);
 
-                    sh.angle = 0.0f;
-                    sh.tumblePhase = 0.0f;
-                    sh.alpha = (mat == ShatterMaterial::GLASS) ? 175 : 255;
-                    sh.heatKelvin = 7800.0f;
+                if (fractureMode < 42) {
+                    // MODE 1 (42%): Intact Uneven Trapezium (4-gon: diverging radial sides + parallel-ish bases)
+                    Vec2 trapVerts[4] = { p00, p10, p11, p01 };
+                    addPolygonShard(target, trapVerts, 4, hitX, hitY, maxObjRadius, intensity);
+                }
+                else if (fractureMode < 74) {
+                    // MODE 2 (32%): Irregular General Quadrilateral (4-gon: skewed non-parallel sides)
+                    Vec2 skew00 = Vec2::lerp(p00, p01, (float)random(0, 24) * 0.01f);
+                    Vec2 skew10 = Vec2::lerp(p10, p11, (float)random(-18, 25) * 0.01f);
+                    Vec2 quadVerts[4] = { skew00, skew10, p11, p01 };
+                    addPolygonShard(target, quadVerts, 4, hitX, hitY, maxObjRadius, intensity);
+                }
+                else if (fractureMode < 90 && (lastSpawnedCount + 1 < MAX_SHARDS)) {
+                    // MODE 3 (16%): Oblique Edge-to-Corner Cleavage -> 1 Uneven Triangle (3-gon) + 1 Uneven Trapezium/Quad (4-gon)!
+                    float splitT = 0.28f + (float)random(0, 44) * 0.01f;
+                    Vec2 edgeMid = Vec2::lerp(p01, p11, splitT);
 
-                    // Sample sprite or assign faceted material shading
-                    if (spritePixels && spriteW > 0 && spriteH > 0) {
-                        int sx = constrain((int)((centroid.x - left) * spriteW / objW), 0, spriteW - 1);
-                        int sy = constrain((int)((centroid.y - top)  * spriteH / objH), 0, spriteH - 1);
-                        uint16_t sampled = spritePixels[sy * spriteW + sx];
-                        sh.baseColor = (sampled != 0x0000) ? sampled : baseColor;
+                    Vec2 triVerts[3]  = { p00, edgeMid, p01 };
+                    Vec2 quadVerts[4] = { p00, p10, p11, edgeMid };
+                    addPolygonShard(target, triVerts,  3, hitX, hitY, maxObjRadius, intensity);
+                    addPolygonShard(target, quadVerts, 4, hitX, hitY, maxObjRadius, intensity);
+                }
+                else {
+                    // MODE 4 (10%): Diagonal Cleavage -> 2 Uneven Triangles (3-gon + 3-gon)
+                    if (random(0, 2) == 0) {
+                        Vec2 triA[3] = { p00, p10, p11 };
+                        Vec2 triB[3] = { p00, p11, p01 };
+                        addPolygonShard(target, triA, 3, hitX, hitY, maxObjRadius, intensity);
+                        addPolygonShard(target, triB, 3, hitX, hitY, maxObjRadius, intensity);
                     } else {
-                        uint8_t shade = (uint8_t)random(165, 255);
-                        sh.baseColor = Color::scaleBrightness565(baseColor, shade);
+                        Vec2 triA[3] = { p00, p10, p01 };
+                        Vec2 triB[3] = { p10, p11, p01 };
+                        addPolygonShard(target, triA, 3, hitX, hitY, maxObjRadius, intensity);
+                        addPolygonShard(target, triB, 3, hitX, hitY, maxObjRadius, intensity);
                     }
-                    sh.edgeColor = (mat == ShatterMaterial::GLASS)
-                        ? Colors565::White
-                        : Color::scaleBrightness565(sh.baseColor, 115);
-
-                    // Realistic physical fracture impulse:
-                    // Shards right at the impact point get knocked outward & downward;
-                    // Shards farther away crack loose after a tiny propagation delay and topple under gravity!
-                    Vec2 fromHit = centroid - Vec2(hitX, hitY);
-                    float dist = fromHit.length();
-                    Vec2 dir = (dist > 1.0f) ? (fromHit / dist) : Vec2(0.0f, -1.0f);
-
-                    float prox = constrain(1.0f - (dist / (objW * 0.95f)), 0.08f, 1.0f);
-                    sh.releaseDelay = (1.0f - prox) * 0.055f; // Crack travels outward in 0..55ms!
-
-                    float horizPush = (dir.x * (75.0f + 165.0f * prox) + random(-35, 36)) * intensity;
-                    float vertPush  = (dir.y * (55.0f + 120.0f * prox) - (35.0f * prox) + random(-25, 35)) * intensity;
-
-                    sh.vel = Vec2(horizPush, vertPush);
-                    sh.angularVel = ((dir.x >= 0.0f ? 1.0f : -1.0f) * (2.2f + 5.5f * prox) + random(-20, 21) * 0.1f) * intensity;
-                    sh.tumbleSpeed = (3.0f + random(0, 50) * 0.1f) * intensity;
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // Universal Wrapper: Draw ANY object via a lambda/callable, capture its
+    // live rendered pixels & shape from the framebuffer, and shatter it!
+    // ------------------------------------------------------------------------
+    template <typename DrawCallable>
+    void shatterWrappedDraw(
+        RGBGameEngine &eng,
+        float boxX, float boxY, float boxW, float boxH,
+        float hitX, float hitY,
+        DrawCallable drawFn,
+        int avgParticleCount = 48,
+        float intensity = 1.25f,
+        ShatterMaterial mat = ShatterMaterial::GLASS,
+        ShatterShape boundaryShape = ShatterShape::RECTANGLE,
+        uint16_t fallbackColor = Colors565::ElectricBlue)
+    {
+        // Render the object onto the current draw buffer so its exact procedural colors are present
+        drawFn();
+        ShatterTarget2D target = ShatterTarget2D::makeFromFramebuffer(
+            eng.getDrawBuffer(), 800, 480, boxX, boxY, boxW, boxH, boundaryShape, fallbackColor
+        );
+        shatterTarget(target, hitX, hitY, avgParticleCount, intensity, mat);
+    }
+
+    // Backward-compatible overload (automatically uses radial uneven trapezium/quad/triangle fracture!)
+    void triggerShatter(
+        float centerX, float centerY, float halfSize,
+        float impactX, float impactY,
+        ShatterMaterial mat = ShatterMaterial::GLASS,
+        float intensity = 1.0f,
+        uint16_t baseColor = Colors565::ElectricBlue,
+        const uint16_t *spritePixels = nullptr, int16_t spriteW = 0, int16_t spriteH = 0,
+        int avgParticleCount = -1,
+        ShatterShape shape = ShatterShape::RECTANGLE)
+    {
+        float objW = (spriteW > 0) ? (float)spriteW : (halfSize * 2.1f);
+        float objH = (spriteH > 0) ? (float)spriteH : (halfSize * 1.95f);
+
+        ShatterTarget2D target;
+        if (spritePixels && spriteW > 0 && spriteH > 0) {
+            target = ShatterTarget2D::makeSprite(spritePixels, spriteW, spriteH,
+                                                 centerX - objW * 0.5f, centerY - objH * 0.5f,
+                                                 objW, objH, 0x0000, baseColor);
+        } else if (shape == ShatterShape::CIRCLE) {
+            target = ShatterTarget2D::makeCircle(centerX, centerY, halfSize, baseColor);
+        } else if (shape == ShatterShape::ELLIPSE) {
+            target = ShatterTarget2D::makeEllipse(centerX, centerY, objW * 0.5f, objH * 0.5f, baseColor);
+        } else if (shape == ShatterShape::TRIANGLE) {
+            target = ShatterTarget2D::makeTriangle(
+                Vec2(centerX, centerY - objH * 0.5f),
+                Vec2(centerX + objW * 0.5f, centerY + objH * 0.5f),
+                Vec2(centerX - objW * 0.5f, centerY + objH * 0.5f),
+                baseColor);
+        } else {
+            target = ShatterTarget2D::makeRect(centerX - objW * 0.5f, centerY - objH * 0.5f, objW, objH, baseColor);
+        }
+
+        int pCount = (avgParticleCount > 0) ? avgParticleCount : (int)(defaultAvgParticles * constrain(intensity, 0.6f, 1.8f));
+        shatterTarget(target, impactX, impactY, pCount, intensity, mat);
     }
 
     void update(float dt) {
@@ -468,14 +881,13 @@ public:
             Shard2D &sh = shards[i];
             if (!sh.active || sh.settled) continue;
 
-            // Wait for crack wave to reach this shard before it detaches
             if (sh.releaseDelay > 0.0f) {
                 sh.releaseDelay -= dt;
                 continue;
             }
 
             sh.vel.y += gravity * dt;
-            sh.vel.x *= 0.996f; // Subtle air drag
+            sh.vel.x *= 0.996f;
             sh.pos += sh.vel * dt;
             sh.angle += sh.angularVel * dt;
             sh.tumblePhase += sh.tumbleSpeed * dt;
@@ -485,7 +897,6 @@ public:
                 sh.baseColor = Color::kelvin565((uint16_t)sh.heatKelvin);
             }
 
-            // Realistic floor collision & debris settling
             float bottomLimit = floorY - sh.boundingR * 0.45f;
             if (sh.pos.y >= bottomLimit) {
                 sh.pos.y = bottomLimit;
@@ -496,7 +907,6 @@ public:
                 sh.angularVel *= floorFriction;
                 sh.tumbleSpeed *= 0.75f;
 
-                // Settle into stationary floor debris once kinetic energy is exhausted
                 if (fabsf(sh.vel.y) < 28.0f && fabsf(sh.vel.x) < 12.0f) {
                     sh.vel = Vec2(0.0f, 0.0f);
                     sh.angularVel = 0.0f;
@@ -505,7 +915,6 @@ public:
                 }
             }
 
-            // Side wall bounce so shards stay inside the room
             if (sh.pos.x < 18.0f)  { sh.pos.x = 18.0f;  sh.vel.x = fabsf(sh.vel.x) * 0.5f; }
             if (sh.pos.x > 782.0f) { sh.pos.x = 782.0f; sh.vel.x = -fabsf(sh.vel.x) * 0.5f; }
         }
@@ -518,27 +927,46 @@ public:
             const Shard2D &sh = shards[i];
             if (!sh.active) continue;
 
-            // Simulate 3D tumbling foreshortening along local Y axis as the shard spins in the air
             float foreshorten = sh.settled ? 0.75f : (0.35f + 0.65f * fabsf(cosf(sh.tumblePhase)));
-            Vec2 lv0(sh.localVerts[0].x, sh.localVerts[0].y * foreshorten);
-            Vec2 lv1(sh.localVerts[1].x, sh.localVerts[1].y * foreshorten);
-            Vec2 lv2(sh.localVerts[2].x, sh.localVerts[2].y * foreshorten);
+            Vec2 v[4];
+            for (uint8_t k = 0; k < sh.vertCount; k++) {
+                Vec2 lv(sh.localVerts[k].x, sh.localVerts[k].y * foreshorten);
+                v[k] = sh.pos + lv.rotated(sh.angle);
+            }
 
-            Vec2 v0 = sh.pos + lv0.rotated(sh.angle);
-            Vec2 v1 = sh.pos + lv1.rotated(sh.angle);
-            Vec2 v2 = sh.pos + lv2.rotated(sh.angle);
+            int16_t x0 = (int16_t)v[0].x, y0 = (int16_t)v[0].y;
+            int16_t x1 = (int16_t)v[1].x, y1 = (int16_t)v[1].y;
+            int16_t x2 = (int16_t)v[2].x, y2 = (int16_t)v[2].y;
 
-            if (material == ShatterMaterial::GLASS) {
-                // Specular reflection glint when a tumbling glass shard catches overhead light
-                bool glint = (!sh.settled) && (foreshorten > 0.92f);
-                uint16_t col = glint ? Colors565::White : sh.baseColor;
-                eng.fillTriangleAlpha((int16_t)v0.x, (int16_t)v0.y, (int16_t)v1.x, (int16_t)v1.y, (int16_t)v2.x, (int16_t)v2.y, col, sh.alpha);
-                eng.drawTriangle((int16_t)v0.x, (int16_t)v0.y, (int16_t)v1.x, (int16_t)v1.y, (int16_t)v2.x, (int16_t)v2.y, sh.edgeColor);
+            if (sh.vertCount == 4) {
+                int16_t x3 = (int16_t)v[3].x, y3 = (int16_t)v[3].y;
+                if (material == ShatterMaterial::GLASS) {
+                    bool glint = (!sh.settled) && (foreshorten > 0.92f);
+                    uint16_t col = glint ? Colors565::White : sh.baseColor;
+                    eng.fillTriangleAlpha(x0, y0, x1, y1, x2, y2, col, sh.alpha);
+                    eng.fillTriangleAlpha(x0, y0, x2, y2, x3, y3, col, sh.alpha);
+                } else {
+                    uint8_t tiltShade = (uint8_t)(155 + 100 * foreshorten);
+                    uint16_t litCol = Color::scaleBrightness565(sh.baseColor, tiltShade);
+                    eng.fillQuad(x0, y0, x1, y1, x2, y2, x3, y3, litCol);
+                }
+                // Draw only the 4 outer perimeter edges of the uneven trapezium / quadrilateral!
+                eng.drawLine(x0, y0, x1, y1, sh.edgeColor);
+                eng.drawLine(x1, y1, x2, y2, sh.edgeColor);
+                eng.drawLine(x2, y2, x3, y3, sh.edgeColor);
+                eng.drawLine(x3, y3, x0, y0, sh.edgeColor);
             } else {
-                uint8_t tiltShade = (uint8_t)(155 + 100 * foreshorten);
-                uint16_t litCol = Color::scaleBrightness565(sh.baseColor, tiltShade);
-                eng.fillTriangle((int16_t)v0.x, (int16_t)v0.y, (int16_t)v1.x, (int16_t)v1.y, (int16_t)v2.x, (int16_t)v2.y, litCol);
-                eng.drawTriangle((int16_t)v0.x, (int16_t)v0.y, (int16_t)v1.x, (int16_t)v1.y, (int16_t)v2.x, (int16_t)v2.y, sh.edgeColor);
+                if (material == ShatterMaterial::GLASS) {
+                    bool glint = (!sh.settled) && (foreshorten > 0.92f);
+                    uint16_t col = glint ? Colors565::White : sh.baseColor;
+                    eng.fillTriangleAlpha(x0, y0, x1, y1, x2, y2, col, sh.alpha);
+                    eng.drawTriangle(x0, y0, x1, y1, x2, y2, sh.edgeColor);
+                } else {
+                    uint8_t tiltShade = (uint8_t)(155 + 100 * foreshorten);
+                    uint16_t litCol = Color::scaleBrightness565(sh.baseColor, tiltShade);
+                    eng.fillTriangle(x0, y0, x1, y1, x2, y2, litCol);
+                    eng.drawTriangle(x0, y0, x1, y1, x2, y2, sh.edgeColor);
+                }
             }
         }
     }
