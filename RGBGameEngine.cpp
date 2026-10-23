@@ -1774,7 +1774,7 @@ void RGBGameEngine::drawAtmosphericSkyDome(float timeOfDay01, int16_t horizonY, 
         skyTop = lerpCol(nightTop, dawnTop, u); skyHor = lerpCol(nightHor, dawnHor, u); daylight = 0.18f + 0.17f * u;
     }
 
-    fillLinearGradientRect(0, 0, display.width, horizonY, skyTop, skyHor, true, false);
+    fillLinearGradientRect(0, 0, display.width, horizonY, skyTop, skyHor, false, false);
 
     if (drawStars && daylight < 0.55f) {
         uint8_t starAlpha = (uint8_t)constrain((int)((0.55f - daylight) * 620.0f), 0, 240);

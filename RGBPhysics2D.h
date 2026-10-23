@@ -2629,4 +2629,396 @@ public:
     }
 };
 
+// ============================================================================
+// 17. UNIVERSAL LIVING ANATOMY PROFILE & GORE PHYSICS (CRUSH, HEAD CUT, CHEST STAB)
+//     Stores posture (Horizontal Quadruped / Vertical Biped / Aerial Flyer) and
+//     normalized anatomical landmarks (headUV, neckUV, chestUV, waistUV) so
+//     universal crush and cutBlood functions work on ANY character or creature!
+// ============================================================================
+enum class LivingPostureType : uint8_t {
+    HORIZONTAL_QUADRUPED = 0, // Bulls, Tigers, Wolves, Bears, Crocs, Rhinos, Scorpions (Head at front-left)
+    VERTICAL_BIPED       = 1, // Humans/Ninjas, Zombies, Skeletons, Trolls, Gorillas, Minotaurs (Head at top)
+    AERIAL_FLYER         = 2  // Dragons, Eagles, Bats, Harpies, Bees (Head at front-mid, wings above)
+};
+
+enum class AnatomicalOp : uint8_t {
+    CRUSH_PANCAKE      = 0, // Stomped from above: vertical squash + horizontal splay + blood pool
+    HEAD_DECAPITATE    = 1, // Cut at neckUV: severed head flies & tumbles while neck stump spurts blood!
+    CHEST_STAB_IMPALE  = 2, // Stabbed at chestUV: blade impales heart/chest, arterial jet + body topples!
+    TORSO_CLEAVE_SPLIT = 3  // Sliced through waistUV/chestUV: upper & lower body halves separate with blood!
+};
+
+struct LivingAnatomyProfile2D {
+    LivingPostureType posture = LivingPostureType::HORIZONTAL_QUADRUPED;
+    Vec2 headUV  = Vec2(0.16f, 0.30f); // Normalized [0..1] head center inside (x, y, w, h)
+    Vec2 neckUV  = Vec2(0.26f, 0.36f); // Normalized [0..1] neck decapitation plane point
+    Vec2 chestUV = Vec2(0.45f, 0.48f); // Normalized [0..1] chest/heart stab point
+    Vec2 waistUV = Vec2(0.64f, 0.52f); // Normalized [0..1] waist/belly bisection point
+    float headRadiusRatio = 0.22f;     // Head radius as fraction of min(w, h)
+
+    static LivingAnatomyProfile2D makeQuadruped() {
+        LivingAnatomyProfile2D p;
+        p.posture = LivingPostureType::HORIZONTAL_QUADRUPED;
+        p.headUV  = Vec2(0.16f, 0.30f);
+        p.neckUV  = Vec2(0.26f, 0.35f);
+        p.chestUV = Vec2(0.45f, 0.48f);
+        p.waistUV = Vec2(0.66f, 0.52f);
+        p.headRadiusRatio = 0.24f;
+        return p;
+    }
+
+    static LivingAnatomyProfile2D makeBiped() {
+        LivingAnatomyProfile2D p;
+        p.posture = LivingPostureType::VERTICAL_BIPED;
+        p.headUV  = Vec2(0.48f, 0.15f);
+        p.neckUV  = Vec2(0.48f, 0.26f);
+        p.chestUV = Vec2(0.48f, 0.45f);
+        p.waistUV = Vec2(0.50f, 0.65f);
+        p.headRadiusRatio = 0.20f;
+        return p;
+    }
+
+    static LivingAnatomyProfile2D makeFlyer() {
+        LivingAnatomyProfile2D p;
+        p.posture = LivingPostureType::AERIAL_FLYER;
+        p.headUV  = Vec2(0.18f, 0.42f);
+        p.neckUV  = Vec2(0.30f, 0.44f);
+        p.chestUV = Vec2(0.50f, 0.50f);
+        p.waistUV = Vec2(0.70f, 0.52f);
+        p.headRadiusRatio = 0.21f;
+        return p;
+    }
+
+    static LivingAnatomyProfile2D horizontalQuadruped() { return makeQuadruped(); }
+    static LivingAnatomyProfile2D verticalBiped()       { return makeBiped(); }
+    static LivingAnatomyProfile2D aerialFlyer()         { return makeFlyer(); }
+
+    inline Vec2 getHeadWorld(float x, float y, float w, float h)  const { return Vec2(x + headUV.x * w,  y + headUV.y * h); }
+    inline Vec2 getNeckWorld(float x, float y, float w, float h)  const { return Vec2(x + neckUV.x * w,  y + neckUV.y * h); }
+    inline Vec2 getChestWorld(float x, float y, float w, float h) const { return Vec2(x + chestUV.x * w, y + chestUV.y * h); }
+    inline Vec2 getWaistWorld(float x, float y, float w, float h) const { return Vec2(x + waistUV.x * w, y + waistUV.y * h); }
+};
+
+struct ActiveLivingGoreInstance {
+    bool active = false;
+    AnatomicalOp op = AnatomicalOp::CRUSH_PANCAKE;
+    LivingAnatomyProfile2D profile;
+    float x = 0.0f, y = 0.0f;
+    float origW = 80.0f, origH = 64.0f;
+    float age = 0.0f;
+    float duration = 1.15f;
+    uint16_t c1 = Colors565::SaddleBrown;
+    uint16_t c2 = Colors565::Ivory;
+
+    // Severed Head / Upper-Half independent rigid-body kinematics
+    Vec2 headPos, headVel;
+    float headAngle = 0.0f;
+    float headAngVel = 0.0f;
+    float headRadius = 14.0f;
+
+    // Torso collapse / topple angle
+    float torsoFallAngle = 0.0f;
+    float spurtTimer = 0.0f;
+};
+
+class UniversalLivingGoreSystem2D
+{
+public:
+    static constexpr int MAX_INSTANCES = 4;
+    ActiveLivingGoreInstance slots[MAX_INSTANCES];
+    int nextSlot = 0;
+
+    void clear() {
+        for (int i = 0; i < MAX_INSTANCES; i++) slots[i].active = false;
+    }
+
+    // Automatically determine whether a hit at (hitX, hitY) is a HEAD_DECAPITATE, CHEST_STAB_IMPALE, or TORSO_CLEAVE_SPLIT
+    static AnatomicalOp classifyHitZoneOp(const LivingAnatomyProfile2D &prof, float x, float y, float w, float h, float hitX, float hitY) {
+        Vec2 headPt  = prof.getHeadWorld(x, y, w, h);
+        Vec2 neckPt  = prof.getNeckWorld(x, y, w, h);
+        Vec2 chestPt = prof.getChestWorld(x, y, w, h);
+        Vec2 hitPt(hitX, hitY);
+
+        float dHead  = min((hitPt - headPt).length(), (hitPt - neckPt).length());
+        float dChest = (hitPt - chestPt).length();
+
+        if (prof.posture == LivingPostureType::VERTICAL_BIPED) {
+            if (hitY <= y + h * 0.36f || dHead < dChest * 0.95f) return AnatomicalOp::HEAD_DECAPITATE;
+            if (hitY <= y + h * 0.62f) return AnatomicalOp::CHEST_STAB_IMPALE;
+            return AnatomicalOp::TORSO_CLEAVE_SPLIT;
+        } else {
+            // Horizontal Quadruped or Flyer: front-left is head/neck, middle is chest, rear is torso cleave
+            if (hitX <= x + w * 0.36f || dHead < dChest) return AnatomicalOp::HEAD_DECAPITATE;
+            if (hitX <= x + w * 0.68f) return AnatomicalOp::CHEST_STAB_IMPALE;
+            return AnatomicalOp::TORSO_CLEAVE_SPLIT;
+        }
+    }
+
+    static AnatomicalOp classifyHitZoneOp(float x, float y, float w, float h, float hitX, float hitY, const LivingAnatomyProfile2D &prof) {
+        return classifyHitZoneOp(prof, x, y, w, h, hitX, hitY);
+    }
+
+    // ------------------------------------------------------------------------
+    // UNIVERSAL CRUSH FUNCTION (Stomp from above / heavy vertical crush)
+    // ------------------------------------------------------------------------
+    void triggerUniversalCrush(
+        const LivingAnatomyProfile2D &prof,
+        float x, float y, float w, float h,
+        uint16_t primaryCol, uint16_t secondaryCol,
+        BloodAndDecalSystem2D *bloodSys = nullptr)
+    {
+        triggerUniversalCutBlood(prof, AnatomicalOp::CRUSH_PANCAKE, x, y, w, h, primaryCol, secondaryCol, bloodSys);
+    }
+
+    void triggerUniversalCrush(
+        float x, float y, float w, float h,
+        uint16_t primaryCol, uint16_t secondaryCol,
+        const LivingAnatomyProfile2D &prof,
+        BloodAndDecalSystem2D *bloodSys = nullptr,
+        int bloodDropletCount = 52)
+    {
+        (void)bloodDropletCount;
+        triggerUniversalCutBlood(prof, AnatomicalOp::CRUSH_PANCAKE, x, y, w, h, primaryCol, secondaryCol, bloodSys);
+    }
+
+    // ------------------------------------------------------------------------
+    // UNIVERSAL CUT-BLOOD FUNCTION (Head Cut, Chest Stab, Torso Cleave, or Crush)
+    // ------------------------------------------------------------------------
+    void triggerUniversalCutBlood(
+        float x, float y, float w, float h,
+        uint16_t primaryCol, uint16_t secondaryCol,
+        const LivingAnatomyProfile2D &prof,
+        AnatomicalOp op,
+        float hitX, float hitY, float attackDirX = 1.0f,
+        BloodAndDecalSystem2D *bloodSys = nullptr,
+        int bloodDropletCount = 48)
+    {
+        (void)hitX; (void)hitY; (void)attackDirX; (void)bloodDropletCount;
+        triggerUniversalCutBlood(prof, op, x, y, w, h, primaryCol, secondaryCol, bloodSys);
+    }
+
+    void triggerUniversalCutBlood(
+        const LivingAnatomyProfile2D &prof,
+        AnatomicalOp op,
+        float x, float y, float w, float h,
+        uint16_t primaryCol, uint16_t secondaryCol,
+        BloodAndDecalSystem2D *bloodSys = nullptr)
+    {
+        ActiveLivingGoreInstance &s = slots[nextSlot];
+        nextSlot = (nextSlot + 1) % MAX_INSTANCES;
+
+        s.active         = true;
+        s.op             = op;
+        s.profile        = prof;
+        s.x              = x;
+        s.y              = y;
+        s.origW          = w;
+        s.origH          = h;
+        s.age            = 0.0f;
+        s.duration       = 1.15f;
+        s.c1             = primaryCol;
+        s.c2             = secondaryCol;
+        s.torsoFallAngle = 0.0f;
+        s.spurtTimer     = 0.0f;
+
+        Vec2 headW  = prof.getHeadWorld(x, y, w, h);
+        Vec2 neckW  = prof.getNeckWorld(x, y, w, h);
+        Vec2 chestW = prof.getChestWorld(x, y, w, h);
+
+        s.headPos    = headW;
+        s.headRadius = max(8.0f, min(w, h) * prof.headRadiusRatio);
+        s.headAngle  = 0.0f;
+
+        if (op == AnatomicalOp::HEAD_DECAPITATE) {
+            // Launch severed head upward & spinning!
+            s.headVel    = Vec2(145.0f + (float)random(-40, 80), -440.0f - (float)random(0, 120));
+            s.headAngVel = 14.5f;
+            if (bloodSys) {
+                bloodSys->emitBloodSplatter(neckW.x, neckW.y, 48, -60.0f, -420.0f);
+            }
+        } else if (op == AnatomicalOp::CHEST_STAB_IMPALE) {
+            s.headVel    = Vec2(0.0f, 0.0f);
+            s.headAngVel = 0.0f;
+            if (bloodSys) {
+                bloodSys->emitBloodSplatter(chestW.x, chestW.y, 44, -210.0f, -310.0f);
+            }
+        } else if (op == AnatomicalOp::TORSO_CLEAVE_SPLIT) {
+            s.headPos    = Vec2(x + w * 0.35f, y + h * 0.30f);
+            s.headVel    = Vec2(175.0f, -360.0f);
+            s.headAngVel = -9.5f;
+            if (bloodSys) {
+                bloodSys->emitBloodSplatter(chestW.x, chestW.y, 50, 80.0f, -380.0f);
+            }
+        } else {
+            // CRUSH_PANCAKE
+            if (bloodSys) {
+                bloodSys->emitBloodSplatter(headW.x,  headW.y,  26, -150.0f, -340.0f);
+                bloodSys->emitBloodSplatter(chestW.x, chestW.y, 26,  150.0f, -360.0f);
+            }
+        }
+    }
+
+    void update(float dt, bool charIsMoving, float scrollSpd, float groundY, BloodAndDecalSystem2D *bloodSys = nullptr) {
+        for (int i = 0; i < MAX_INSTANCES; i++) {
+            ActiveLivingGoreInstance &s = slots[i];
+            if (!s.active) continue;
+
+            s.age += dt;
+            if (charIsMoving) {
+                s.x          -= scrollSpd * dt;
+                s.headPos.x  -= scrollSpd * dt;
+            }
+
+            // Bring airborne creatures down to ground
+            if (s.y + s.origH < groundY) {
+                s.y = min(groundY - s.origH * 0.25f, s.y + 980.0f * dt);
+            }
+
+            // Update severed head / cleaved upper-torso ballistics & floor bounce
+            if (s.op == AnatomicalOp::HEAD_DECAPITATE || s.op == AnatomicalOp::TORSO_CLEAVE_SPLIT) {
+                s.headVel.y  += 1480.0f * dt;
+                s.headPos    += s.headVel * dt;
+                s.headAngle  += s.headAngVel * dt;
+                if (s.headPos.y + s.headRadius >= groundY) {
+                    s.headPos.y  = groundY - s.headRadius;
+                    s.headVel.y  = -s.headVel.y * 0.42f;
+                    s.headVel.x *= 0.78f;
+                    s.headAngVel *= 0.75f;
+                }
+            }
+
+            // Continuous arterial neck/chest blood fountain spurts during first 0.45s!
+            if (bloodSys && s.age < 0.45f && s.op != AnatomicalOp::CRUSH_PANCAKE) {
+                s.spurtTimer += dt;
+                if (s.spurtTimer >= 0.08f) {
+                    s.spurtTimer = 0.0f;
+                    Vec2 woundPt = (s.op == AnatomicalOp::HEAD_DECAPITATE)
+                                   ? s.profile.getNeckWorld(s.x, s.y, s.origW, s.origH)
+                                   : s.profile.getChestWorld(s.x, s.y, s.origW, s.origH);
+                    bloodSys->emitBloodSplatter(woundPt.x, woundPt.y, 10, (float)random(-90, 90), -320.0f);
+                }
+            }
+
+            s.torsoFallAngle = min(1.52f, s.age * 4.2f);
+
+            if (s.age >= s.duration || s.x + s.origW < -100.0f) {
+                s.active = false;
+            }
+        }
+    }
+
+    void draw(RGBGameEngine &eng, int groundY, const Camera2D &cam) {
+        float z = cam.zoom;
+        int16_t gY = cam.worldToScreenY((float)groundY);
+
+        for (int i = 0; i < MAX_INSTANCES; i++) {
+            const ActiveLivingGoreInstance &s = slots[i];
+            if (!s.active) continue;
+
+            float u = constrain(s.age / s.duration, 0.0f, 1.0f);
+            int16_t cx = cam.worldToScreenX(s.x + s.origW * 0.5f);
+            int16_t wOrig = cam.scaleDim(s.origW);
+            int16_t hOrig = cam.scaleDim(s.origH);
+
+            // Expanding ground blood pool under all slain living beings
+            int16_t poolW = (int16_t)(wOrig * (0.75f + 0.55f * u));
+            eng.fillEllipse(cx, gY - 2, max((int16_t)6, (int16_t)(poolW / 2)), max((int16_t)3, (int16_t)(6 * z)), Colors565::Crimson);
+            eng.fillEllipse(cx, gY - 2, max((int16_t)4, (int16_t)(poolW / 3)), max((int16_t)2, (int16_t)(4 * z)), Colors565::DarkRed);
+
+            if (s.op == AnatomicalOp::CRUSH_PANCAKE) {
+                // 1. UNIVERSAL CRUSH: Vertical pancake compression + horizontal volume splay
+                float squashY = max(0.15f, 1.0f - min(1.0f, s.age * 7.8f) * 0.85f);
+                float splayX  = 1.0f + min(1.0f, s.age * 7.8f) * 0.58f;
+                int16_t cw = cam.scaleDim(s.origW * splayX);
+                int16_t ch = max((int16_t)6, cam.scaleDim(s.origH * squashY));
+                int16_t x  = cx - cw / 2;
+                int16_t y  = gY - ch;
+
+                uint16_t bodyCol = Color::lerp565(s.c1, Colors565::Crimson, 115);
+                eng.fillRoundRect(x, y, cw, ch, max(2, (int)(ch / 2)), bodyCol);
+                eng.drawRoundRect(x, y, cw, ch, max(2, (int)(ch / 2)), Colors565::Crimson);
+
+                // Splayed bones/horns
+                int16_t boneL = (int16_t)(14 * z);
+                eng.drawThickLine(x - boneL, gY - 2, x + 6, y + ch / 2, max((int16_t)2, (int16_t)(4 * z)), s.c2);
+                eng.drawThickLine(x + cw - 6, y + ch / 2, x + cw + boneL, gY - 2, max((int16_t)2, (int16_t)(4 * z)), s.c2);
+
+                if (u < 0.78f) {
+                    eng.drawTextShadow(cx - 32, y - (int16_t)(16 * z + s.age * 44.0f * z), "CRUSHED!", Colors565::NeonRed, Colors565::Black, 1, 1);
+                }
+            }
+            else if (s.op == AnatomicalOp::HEAD_DECAPITATE) {
+                // 2. UNIVERSAL HEAD CUT: Collapsing headless body + neck blood stump + tumbling severed head!
+                int16_t collapseH = max((int16_t)12, (int16_t)(hOrig * (0.72f - 0.42f * min(1.0f, s.age * 2.5f))));
+                int16_t bx = cx - wOrig / 3;
+                int16_t by = gY - collapseH;
+                eng.fillRoundRect(bx, by, (wOrig * 2) / 3, collapseH, max(3, (int)(7 * z)), s.c1);
+                eng.drawRoundRect(bx, by, (wOrig * 2) / 3, collapseH, max(3, (int)(7 * z)), Colors565::Crimson);
+
+                // Exposed crimson neck stump at neckUV
+                int16_t neckX = cam.worldToScreenX(s.x + s.profile.neckUV.x * s.origW);
+                int16_t neckY = by + (int16_t)(4 * z);
+                eng.fillCircle(neckX, neckY, max((int16_t)4, (int16_t)(8 * z)), Colors565::Crimson);
+                eng.drawCircle(neckX, neckY, max((int16_t)4, (int16_t)(8 * z)), Colors565::White);
+
+                // Flying / bouncing severed head!
+                int16_t hx = cam.worldToScreenX(s.headPos.x);
+                int16_t hy = cam.worldToScreenY(s.headPos.y);
+                int16_t hr = max((int16_t)6, cam.scaleDim(s.headRadius));
+                eng.fillCircle(hx, hy, hr, s.c1);
+                eng.fillCircle(hx, hy + hr / 2, max((int16_t)3, (int16_t)(hr / 2)), Colors565::Crimson); // Severed neck base
+                // Rotating dead eye on severed head
+                int16_t ex = hx + (int16_t)(cosf(s.headAngle) * (hr * 0.45f));
+                int16_t ey = hy + (int16_t)(sinf(s.headAngle) * (hr * 0.45f));
+                eng.fillCircle(ex, ey, max((int16_t)2, (int16_t)(3 * z)), Colors565::NeonRed);
+
+                if (u < 0.80f) {
+                    eng.drawTextShadow(cx - 36, by - (int16_t)(18 * z + s.age * 45.0f * z), "HEAD CUT!", Colors565::NeonRed, Colors565::Black, 1, 1);
+                }
+            }
+            else if (s.op == AnatomicalOp::CHEST_STAB_IMPALE) {
+                // 3. UNIVERSAL CHEST STAB: Body toppling backward with blade impaled in chestUV + arterial wound!
+                float tilt = min(1.0f, s.age * 2.8f);
+                int16_t curW = (int16_t)(wOrig * (0.75f + 0.35f * tilt));
+                int16_t curH = max((int16_t)14, (int16_t)(hOrig * (0.92f - 0.58f * tilt)));
+                int16_t bx = cx - curW / 2;
+                int16_t by = gY - curH;
+
+                eng.fillRoundRect(bx, by, curW, curH, max(3, (int)(7 * z)), Color::lerp565(s.c1, Colors565::Crimson, 85));
+                eng.drawRoundRect(bx, by, curW, curH, max(3, (int)(7 * z)), s.c2);
+
+                // Chest wound & impaled Ninja Blade at chestUV
+                int16_t chestX = bx + (int16_t)(s.profile.chestUV.x * curW);
+                int16_t chestY = by + (int16_t)(s.profile.chestUV.y * curH);
+                eng.fillCircle(chestX, chestY, max((int16_t)4, (int16_t)(9 * z)), Colors565::Crimson);
+                // Gleaming blade sticking out of the chest wound!
+                eng.drawThickLine(chestX - (int16_t)(22 * z), chestY - (int16_t)(8 * z), chestX + (int16_t)(6 * z), chestY + (int16_t)(4 * z),
+                                  max((int16_t)2, (int16_t)(4 * z)), Colors565::Silver);
+                eng.drawLine(chestX - (int16_t)(22 * z), chestY - (int16_t)(8 * z), chestX + (int16_t)(6 * z), chestY + (int16_t)(4 * z), Colors565::NeonCyan);
+
+                if (u < 0.80f) {
+                    eng.drawTextShadow(cx - 38, by - (int16_t)(18 * z + s.age * 45.0f * z), "CHEST STAB!", Colors565::NeonRed, Colors565::Black, 1, 1);
+                }
+            }
+            else {
+                // 4. UNIVERSAL TORSO CLEAVE SPLIT: Upper & Lower halves separating with crimson slash plane!
+                int16_t halfW = max((int16_t)10, (int16_t)(wOrig / 2));
+                int16_t halfH = max((int16_t)10, (int16_t)(hOrig / 2));
+                // Lower/rear half collapsing on ground
+                eng.fillRoundRect(cx - halfW / 2, gY - halfH, halfW, halfH, max(2, (int)(5 * z)), s.c1);
+                eng.drawFastHLine(cx - halfW / 2, gY - halfH, halfW, Colors565::Crimson);
+                // Upper/front cleaved half flying along headPos trajectory
+                int16_t ux = cam.worldToScreenX(s.headPos.x);
+                int16_t uy = cam.worldToScreenY(s.headPos.y);
+                eng.fillRoundRect(ux - halfW / 2, uy - halfH / 2, halfW, halfH, max(2, (int)(5 * z)), s.c1);
+                eng.drawRoundRect(ux - halfW / 2, uy - halfH / 2, halfW, halfH, max(2, (int)(5 * z)), Colors565::Crimson);
+
+                if (u < 0.80f) {
+                    eng.drawTextShadow(cx - 36, gY - hOrig - (int16_t)(14 * z + s.age * 42.0f * z), "CLEAVED!", Colors565::NeonRed, Colors565::Black, 1, 1);
+                }
+            }
+        }
+    }
+};
+
 #endif
